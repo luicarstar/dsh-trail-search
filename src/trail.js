@@ -20,8 +20,10 @@ function required(value,label,max=2000) {
   if (typeof value !== 'string' || !value.trim() || value.length > max) throw new Error(`${label} 必须是非空字符串（最多 ${max} 字符）`);
   return value.trim();
 }
+const ID_PATTERN = /^[\p{L}\p{N}_-]{1,160}$/u;
+function validId(value) { return typeof value === 'string' && ID_PATTERN.test(value); }
 function safeId(value) {
-  if (typeof value !== 'string' || !/^[\p{L}\p{N}_-]{1,160}$/u.test(value)) throw new Error('trailId 格式不正确');
+  if (!validId(value)) throw new Error('trailId 格式不正确');
   return value;
 }
 function hostOf(url) { try { return new URL(url).hostname; } catch { return ''; } }
@@ -80,6 +82,7 @@ export class TrailStore {
     this.dataDir = resolve(dataDir); this.now = now; this.normalizer = normalizer;
     this.options = {rules:copy(rules),blacklist:[...blacklist],resolveShortLinks,fetch};
     this.defaults = budgetConfig(budget); this.trails = new Map(); this.tail = Promise.resolve(); this.closed = false; this.closing = false;
+    this.skippedDirs = [];
   }
   _dir(id) { return join(this.dataDir,'trails',safeId(id)); }
   async _open() {
@@ -103,7 +106,10 @@ export class TrailStore {
     }
     for (const dir of await readdir(join(this.dataDir,'trails'),{withFileTypes:true})) {
       if (!dir.isDirectory()) continue;
-      safeId(dir.name);
+      // Foreign directories (backup folders, sync clients, manual copies) must not
+      // block the whole store: skip anything that is not a valid trail id instead
+      // of letting safeId() abort _open() and hide every existing trail.
+      if (!validId(dir.name)) { this.skippedDirs.push(dir.name); continue; }
       await this._load(dir.name);
     }
     const active = new Map();
@@ -397,6 +403,9 @@ export class TrailStore {
     });
   }
   list(sessionId) { return this._serial(() => copy([...this.trails.values()].filter(t => sessionId === undefined || t.meta.sessionId === sessionId).map(t => t.meta).sort((a,b) => b.updatedAt.localeCompare(a.updatedAt)))); }
+  // Directories under trails/ that were not loaded because their name is not a
+  // valid trail id. Surfaced so a skipped trail is never silently invisible.
+  skipped() { return this._serial(() => [...this.skippedDirs]); }
   active(sessionId) { return this._serial(() => { const state=[...this.trails.values()].find(t => t.meta.sessionId === sessionId && t.meta.status === 'active');return state ? this._public(state) : null; }); }
   map(id,format='tree') { return this._serial(() => renderMap(this._find(id),format)); }
   status(id) {

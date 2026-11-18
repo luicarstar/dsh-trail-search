@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, appendFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-const root='C:/Users/Administrator/Documents/Codex/2026-11-10/sha256/work';
+import { tmpdir } from 'node:os';
+const root=tmpdir();
 const storeModule=await import('../src/trail.js').catch(e=>{if(e.code==='ERR_MODULE_NOT_FOUND')return {};throw e;});
 const reportModule=await import('../src/report.js').catch(e=>{if(e.code==='ERR_MODULE_NOT_FOUND')return {};throw e;});
 async function fixture(t,options={}) {
@@ -150,4 +151,16 @@ test('result body and node updates recover from the same committed transaction',
   const recovered=await storeModule.TrailStore.open({dataDir,resolveShortLinks:false});t.after(()=>recovered.close());
   assert.equal((await recovered.get(trail.id)).nodes[0].summary,'Committed.');
   assert.match(await readFile(resultPath,'utf8'),/Committed body/);
+});
+
+test('foreign directories under trails/ are skipped instead of blocking the whole store',async t=>{
+  const {store,dataDir}=await fixture(t);
+  const trail=await store.start({sessionId:'s',goal:'Survives stray directories',seeds:['https://example.com']});
+  await store.close();
+  const {mkdir}=await import('node:fs/promises');
+  for(const name of ['临时文件夹 带空格','.sync-backup','备份 2026']) await mkdir(join(dataDir,'trails',name),{recursive:true});
+  const reopened=await storeModule.TrailStore.open({dataDir,resolveShortLinks:false});t.after(()=>reopened.close());
+  assert.equal((await reopened.list()).length,1,'existing trail must still load');
+  assert.equal((await reopened.list())[0].id,trail.id);
+  assert.deepEqual(await reopened.skipped(),['.sync-backup','临时文件夹 带空格','备份 2026']);
 });

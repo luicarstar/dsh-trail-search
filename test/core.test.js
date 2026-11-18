@@ -230,3 +230,25 @@ test('result paths inside the trail stay relative so the trail survives relocati
   assert.equal(flagged.resultFile,outside);
   assert.equal((await store.readResult(trail.id,'n1')).external,true);
 });
+
+test('a bloated journal is compacted and still replays completely',async t=>{
+  // Small thresholds keep the test fast while exercising the same code path.
+  const {store,dataDir}=await fixture(t,{compactMinBytes:4096,compactRatio:1.5});
+  const trail=await store.start({sessionId:'s',goal:'Compaction',seeds:[],budget:{maxNodes:5000,maxPerHost:5000}});
+  const journal=join(dataDir,'trails',trail.id,'transactions.jsonl');
+  let previous=0,shrunk=false;
+  for(let i=0;i<60;i++){
+    await store.add(trail.id,[{url:`https://c${i%7}.example.com/p${i}`,reason:'r'.repeat(150)}]);
+    const size=(await readFile(journal)).length;
+    if(previous>0&&size<previous*0.8) shrunk=true;
+    previous=size;
+  }
+  assert.ok(shrunk,'journal must shrink once it passes the compaction floor');
+  const nodes=(await store.get(trail.id)).nodes.length;
+  assert.equal(nodes,60);
+  // The compacted journal starts from a snapshot whose seq is not 1; replay must still work.
+  await store.close();
+  const reopened=await storeModule.TrailStore.open({dataDir,resolveShortLinks:false});t.after(()=>reopened.close());
+  assert.equal((await reopened.get(trail.id)).nodes.length,60);
+  assert.equal((await reopened.claim(trail.id,5)).reason,'claimed');
+});

@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, appendFile, readdir, rename, rm, truncate } from 'node:fs/promises';
+import { mkdir, open, readFile, appendFile, readdir, rename, rm, truncate, stat } from 'node:fs/promises';
 import { join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { normalize } from './normalize.js';
@@ -8,6 +8,12 @@ import { classifyDirectory } from './classify.js';
 import { renderMap } from './map.js';
 
 export const DEFAULT_BUDGET = Object.freeze({maxNodes:60,maxDepth:5,maxMinutes:90,maxPerHost:15});
+// Compact a trail journal only when it is clearly bloated: below this floor the extra
+// I/O of rewriting the file is not worth it. The ratio is measured against the real
+// snapshot size; a fresh journal already runs ~1.97x its snapshot because every record
+// repeats the whole meta object, so the trigger sits below that at 1.5x.
+const COMPACT_MIN_BYTES = 512 * 1024;
+const COMPACT_RATIO = 1.5;
 const copy = value => structuredClone(value);
 export function budgetConfig(value = {}) {
   const config = {...DEFAULT_BUDGET,...value};
@@ -75,7 +81,7 @@ export class TrailStore {
     const store = new TrailStore(options);
     try { await store._open(); return store; } catch (error) { await store.close(); throw error; }
   }
-  constructor({dataDir,now=Date.now,normalize:normalizer=normalize,rules=[],blacklist=[],resolveShortLinks=true,fetch,budget} = {}) {
+  constructor({dataDir,now=Date.now,normalize:normalizer=normalize,rules=[],blacklist=[],resolveShortLinks=true,fetch,budget,compactMinBytes,compactRatio} = {}) {
     if (!dataDir) throw new Error('需要 dataDir');
     compileUserRules(rules);
     if (!Array.isArray(blacklist) || blacklist.some(x => typeof x !== 'string')) throw new Error('黑名单必须是字符串数组');
@@ -83,6 +89,10 @@ export class TrailStore {
     this.options = {rules:copy(rules),blacklist:[...blacklist],resolveShortLinks,fetch};
     this.defaults = budgetConfig(budget); this.trails = new Map(); this.tail = Promise.resolve(); this.closed = false; this.closing = false;
     this.skippedDirs = [];
+    // Compaction thresholds are overridable so tests can exercise the path without
+    // writing megabytes of journal.
+    this.compactMinBytes = Number.isFinite(compactMinBytes) ? compactMinBytes : COMPACT_MIN_BYTES;
+    this.compactRatio = Number.isFinite(compactRatio) ? compactRatio : COMPACT_RATIO;
   }
   _dir(id) { return join(this.dataDir,'trails',safeId(id)); }
   async _open() {
@@ -170,6 +180,13 @@ export class TrailStore {
     } else {
       state=newState(transactions[0].meta);
       for (const transaction of transactions) {
+        // A compacted journal begins with a full-state snapshot whose seq is NOT 1, because
+        // the number must keep running so later records stay contiguous. Treat that record
+        // as the new baseline instead of demanding seq === 1.
+        if (transaction.base === true) {
+          if (transaction.meta?.id !== id || !Array.isArray(transaction.nodes) || !Array.isArray(transaction.edges)) throw new Error('trail 事务序列损坏');
+          state=newState(transaction.meta);state.seq=transaction.seq-1;
+        }
         if (transaction.seq !== state.seq+1 || transaction.meta?.id !== id || !Array.isArray(transaction.nodes) || !Array.isArray(transaction.edges)) throw new Error('trail 事务序列损坏');
         this._apply(state,transaction);
         const missing=transaction.nodes.filter(node => (nodeRevisions.get(node.id) ?? 0) < transaction.seq);
@@ -210,6 +227,29 @@ export class TrailStore {
     await appendJson(join(dir,'nodes.jsonl'),nodes.map(node => ({...node,revision:draft.seq})));
     await appendJson(join(dir,'edges.jsonl'),edges);
     await this._writeResults(draft,results);
+    await this._writeViews(draft);
+    await this._maybeCompact(draft);
+  }
+  // The journal is append-only and every record repeats the whole meta object, so a
+  // long-running queue trail grows without bound. Once the journal is both larger than
+  // the live state and past a floor, rewrite it as a single snapshot transaction that
+  // still carries the next seq number, so replay stays strictly contiguous.
+  async _maybeCompact(draft) {
+    const dir=this._dir(draft.meta.id),path=join(dir,'transactions.jsonl');
+    let size;try{size=(await stat(path)).size;}catch{return;}
+    // Cheap gate first: below the floor the rewrite is never worth it, and this avoids
+    // serialising the whole state on every commit.
+    if (size < this.compactMinBytes) return;
+    const snapshot={base:true,seq:draft.seq+1,meta:draft.meta,nodes:[...draft.nodes.values()],edges:draft.edges,results:[...draft.results].map(([nodeId,text])=>({nodeId,text}))};
+    const serialized=JSON.stringify(snapshot)+'\n';
+    // Compare against the real snapshot size, not an estimate: an estimate that drifts
+    // above the truth makes the ratio test impossible to satisfy.
+    if (size < Buffer.byteLength(serialized)*this.compactRatio) return;
+    // Write the snapshot beside the journal and rename over it: a crash leaves either the
+    // old journal or the new one, never a half-written file.
+    await atomicWrite(path,serialized);
+    draft.seq=snapshot.seq;
+    this.trails.set(draft.meta.id,draft);
     await this._writeViews(draft);
   }
   _checkActivation(draft) {

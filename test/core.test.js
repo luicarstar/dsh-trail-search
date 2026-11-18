@@ -254,3 +254,25 @@ test('a bloated journal is compacted and still replays completely',async t=>{
   assert.equal((await reopened.get(trail.id)).nodes.length,60);
   assert.equal((await reopened.claim(trail.id,5)).reason,'claimed');
 });
+
+// 回归：模型常在枚举后紧贴括号或竖线写注释。旧实现按空格切分，会把
+// "useful（结论=…）" 整串当枚举，判为格式不符，节点仍标 done 但统计丢状态。
+test('report keeps STATUS/BLOCKED when a note is glued to the enum',()=>{
+  const cases=[
+    ['STATUS: useful（结论=时间未到）','useful'],
+    ['STATUS: useful 时间未到','useful'],
+    ['STATUS: useful|备注','useful'],
+    ['STATUS: useful, 备注','useful'],
+    ['STATUS: USELESS','useless'],
+    ['STATUS: blocked','blocked'],
+  ];
+  for(const [line,expected] of cases){
+    const r=reportModule.parseReport(line+'\nSUMMARY: x');
+    assert.equal(r.status,expected,`failed on: ${line}`);
+    assert.equal(r.warning,undefined,`unexpected warning on: ${line}`);
+  }
+  assert.equal(reportModule.parseReport('STATUS: blocked\nBLOCKED: captcha（验证码）').blockedReason,'captcha');
+  // 非法枚举仍须被拒，不能因为宽松匹配而放行。
+  assert.equal(reportModule.parseReport('STATUS: 有用\nSUMMARY: x').status,null);
+  assert.equal(reportModule.parseReport('STATUS: maybe\nSUMMARY: x').status,null);
+});

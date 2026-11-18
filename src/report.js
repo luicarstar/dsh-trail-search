@@ -43,6 +43,14 @@ export function conciseSummary(text) {
   const clean = String(text ?? '').trim().replace(/\s+/g, ' ');
   return (clean.match(/[^。！？.!?]+[。！？.!?]*/g) ?? []).slice(0,3).join('').slice(0,600).trim();
 }
+/**
+ * 取字段值的首个枚举 token：遇到空白、全角/半角括号、竖线、逗号、分号或冒号即止。
+ * 允许模型在枚举后紧贴补充说明，不因此丢掉 STATUS/BLOCKED。
+ */
+function firstToken(value) {
+  const token = String(value ?? '').toLowerCase().match(/^[a-z]+/);
+  return token ? token[0] : '';
+}
 export function parseReport(text, { kind } = {}) {
   const raw = redactText(text);
   const output = { status:null, summary:'', items:[], omitted:0, raw };
@@ -57,10 +65,13 @@ export function parseReport(text, { kind } = {}) {
     const field = match[1].toUpperCase(), value = match[2].trim();
     section = field;
     if (field === 'STATUS') {
-      const status = value.toLowerCase().split(/\s+/)[0];
+      // Models often append a note directly after the enum with no space, e.g.
+      // "STATUS: useful（结论=…）" or "STATUS: useful|备注". Splitting on whitespace alone
+      // yields "useful（结论=…）", which fails the enum check and silently drops the status.
+      const status = firstToken(value);
       if (['useful','useless','blocked'].includes(status)) output.status = status;
     } else if (field === 'BLOCKED') {
-      const reason = value.toLowerCase().split(/\s+/)[0];
+      const reason = firstToken(value);
       if (['login','captcha','geo','dead','other'].includes(reason)) output.blockedReason = reason;
     } else if (field === 'KIND') {
       if (/^[a-z][a-z0-9-]{0,63}$/i.test(value)) output.kind = value.toLowerCase();

@@ -19,6 +19,25 @@ NEW: <url> | <优先级 1-5> | <一句理由>
 
 替换模板说明，不原样交回尖括号或枚举。有相关事实或值得跟进的线索用 useful，读完确认无关用 useless，无法读取用 blocked。BLOCKED 取实际原因：login、captcha、geo、dead、other；搜索无结果、工具缺失和页面失效不是同一回事。
 
+### STATUS 必须紧跟枚举值，不要贴注释
+
+解析器只取字段值开头的连续英文字母作为枚举。以下写法都合法，都会被正确识别：
+
+```text
+STATUS: useful
+STATUS: useful 时间未到，非访问失败
+STATUS: useful（结论=尚未定价）
+STATUS: blocked
+BLOCKED: captcha
+```
+
+**以下写法会被判格式不符**：`STATUS: 有用`（中文枚举）、`STATUS: Useful（大写可）` 之外的任何非这三个词的值、`STATUS:` 后直接换行、把说明写在 STATUS 和枚举之间如 `STATUS: 结论=时间未到 useful`。
+
+被判格式不符时节点**仍会标 done**，但原文照存、统计里不计入 useful/useless/blocked，等于这次侦察白做。看到返回里带 `warning: 回报格式不符` 就是踩了这个坑，修正当前节点回报，不要新建节点重来。
+
+中文说明放在 SUMMARY 里，不要塞进 STATUS 行。
+
+
 ## 节点入口与打法分流
 
 使用任务给定的 goal、trailId、nodeId、url、kind、预算和可用工具。nodeId 取真实节点 id，不猜编号；已分配节点时只处理当前任务，不重启搜索、不派发下级任务。当前会话没有某工具时说明缺失，所有参数按真实 schema，不发明站点 API。
@@ -75,3 +94,19 @@ URL 保留真实发现目标；相对链接按当前页面解析为绝对网址�
 
 ## CLI 接入补充
 普通公开页面优先加载 `web-fetch-cli` Skill，通过现有命令执行工具调用 `E:/DSH/home/tools/dsh-web-fetch/cli.js`。CLI 不注册独立模型工具；继承跨进程每 host 限速。无正文再用 read_page，最后已授权浏览器。不关闭限速、不换状态目录绕限；CLI 不可用时如实说明，可用宿主 web_fetch 兜底。
+
+### 抓取通道优先级与各自失效点
+
+| 顺序 | 通道 | 强在哪 | 什么时候它会失效 | 失效后怎么办 |
+| --- | --- | --- | --- | --- |
+| 1 | `dsh-web-fetch` CLI | 逐跳限速计数、可自定义请求头、返回真实字节数与 `truncated` | 目标要 JS 渲染才出正文；站点按 UA 拦（SEC 类）；返回 `E_PRIVATE_NETWORK` | 见下一行；UA 类问题加 `-H`；渲染问题降级到 2 |
+| 2 | `read_page` | 走 modsearch，能抓 JS 渲染后的正文，还给摘要、外链与不确定项 | 页面要登录；目标站被 modsearch 引擎判为不可达 | 降级到 3 |
+| 3 | `browser_*` | 真实登录态、能点能滚，任何前端都能读 | 必须先拿 `trail_browser_lease`；慢；会占用用户浏览器 | 拿不到租约就报 blocked/other，不要抢标签页 |
+| — | `web_fetch`（宿主） | 快、无需外部依赖，适合纯静态页 | 反自动化拦截（SEC 会 403）、需要渲染 | 换 1 或 2 |
+
+**关键判断顺序**：先问"这条链路该来的东西有没有来"。CLI 报 `E_PRIVATE_NETWORK` 而 `web_fetch` 打得开，说明问题在 CLI 的路由层，不是目标站挂了——换通道是止损，但要把这个差异记进 SUMMARY，别当成"站点不可访问"。
+
+**一手源优先**：官方公告、监管申报、公司官网 > 通讯社 > 聚合转载。SEC 这类站点要求带联系方式的 User-Agent，这是它写在页面上的规则，用 `-H` 声明式 UA 是遵守规则，不是绕过。加了 UA 还 403 才算被拦。
+
+**代理环境注意**：本机 DNS 是 fake-IP 模式时，`198.18.*` 会出现在解析结果里。CLI 已修复此问题；若仍遇到，先看 `web-fetch-cli` Skill 的"代理与 fake-IP"一节，不要盲目加 `--allow-private-network`——那是关掉内网保护，不是修问题。
+

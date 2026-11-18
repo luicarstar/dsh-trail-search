@@ -1,0 +1,4 @@
+- insert:
+    - id: trail-search
+      name: dsh-trail-search
+      disabled: true

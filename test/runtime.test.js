@@ -1,0 +1,94 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+const root=tmpdir();
+const runtime=await import('../src/controller.js').catch(e=>{if(e.code==='ERR_MODULE_NOT_FOUND')return {};throw e;});
+async function fixture(t){
+  assert.equal(typeof runtime.createController,'function','runtime controller is missing');
+  const dataDir=await mkdtemp(join(root,'runtime-'));
+  const definitions=new Map(),events=new Map();
+  const agent={id:'session',session:{id:'session',header:{}}};
+  const ctx={tools:{view:()=>({visible:definitions}),get:name=>definitions.get(name),register:tool=>{definitions.set(tool.name,tool);return()=>definitions.delete(tool.name);}},agents:{get:id=>id==='session'?agent:undefined},sessions:{get:id=>id==='session'?agent.session:undefined},get:()=>undefined,on:(name,fn)=>{events.set(name,fn);return()=>events.delete(name);},emit:()=>{}};
+  const control=await runtime.createController(ctx,{dataDir,resolveShortLinks:false});
+  t.after(async()=>{await control.close();await rm(dataDir,{recursive:true,force:true});});
+  return {control,ctx,agent,definitions,events,dataDir};
+}
+test('all eight registered tools execute a standalone search and return compact reports',async t=>{
+  const {control,ctx,agent,definitions}=await fixture(t);
+  const {registerTools}=await import('../src/tools.js');registerTools(ctx,control);
+  assert.equal(definitions.size,8);
+  const call=(name,args)=>definitions.get(name).execute(args,{agent,signal:new AbortController().signal});
+  const trail=await call('trail_start',{goal:'Runtime',seeds:['https://example.com/source']});
+  const next=await call('trail_next',{trailId:trail.id,n:1});assert.equal(next[0].id,'n1');assert.ok(next[0].skill);
+  const lease=await call('trail_browser_lease',{trailId:trail.id,nodeId:'n1',action:'acquire'});assert.equal(lease.acquired,true);
+  const result=await call('trail_report',{trailId:trail.id,nodeId:'n1',report:'STATUS: useful\nFOUND:\n- Detailed finding\nNEW: https://other.com/new | 4 | follow'});
+  assert.equal(result.added,1);assert.ok(!JSON.stringify(result).includes('Detailed finding'));
+  assert.equal(control.lease.current(),null);
+  await call('trail_add',{trailId:trail.id,items:[{url:'https://third.com'}]});
+  await call('trail_skip',{trailId:trail.id,nodeIds:['n3'],reason:'user'});
+  assert.match((await call('trail_map',{trailId:trail.id})).text,/n2/);
+  assert.equal((await call('trail_status',{})).counts.useful,1);
+});
+test('host middleware queues the eleventh actual fetch and browser disposal frees the global lease',async t=>{
+  const {control,agent}=await fixture(t);let clock=0;const waits=[];
+  const {HostLimiter}=await import('../src/budget.js');
+  control.limiter=new HostLimiter({now:()=>clock,sleep:async ms=>{waits.push(ms);clock+=ms;}});
+  const trail=await control.start({goal:'Fetch',seeds:['https://example.com']},agent);
+  let fetched=0;
+  for(let i=0;i<11;i++)await control.execute({name:i%2?'read_page':'web_fetch',arguments:{url:'https://example.com/'+i},agent,signal:new AbortController().signal},async()=>++fetched);
+  assert.equal(fetched,11);assert.deepEqual(waits,[60000]);
+  await control.browserLease({trailId:trail.id,nodeId:'n1',action:'acquire'},agent);
+  await assert.rejects(()=>control.execute({name:'browser_read',arguments:{},agent:{id:'other'},signal:new AbortController().signal},async()=>{}),/租约|lease/);
+  control.agentDisposed({agent});assert.equal(control.lease.current(),null);
+});
+test('provider binds a run, reads results by reference, preserves parent edges and yields queue hints',async t=>{
+  const {control,dataDir}=await fixture(t);
+  const provider=await control.provider.bindRun({runId:'run-one',sessionId:'session',goal:'Queue'});
+  assert.equal(provider.normalize('https://github.com/A/B/issues/1').key,'github:a/b');
+  assert.match(provider.describe({text:'https://t.me/channel'}).hint,/trail-telegram/);
+  assert.equal(provider.priority({priority:3,kind:'directory',depth:0}),4);
+  const resultPath=join(dataDir,'queue-item.md');await writeFile(resultPath,'STATUS: useful\nSUMMARY: Good.\nNEW: https://other.com | 4 | follow');
+  const summary=await provider.onResult({id:'q1',text:'https://example.com/source'},resultPath);
+  assert.equal(summary.added,1);
+  const state=await control.store.get(provider.trailId);
+  assert.equal(state.mode,'queue');assert.equal(state.runId,'run-one');assert.equal(state.nodes[0].resultFile,resultPath);
+  assert.equal(state.edges[0].from,'n1');
+  await assert.rejects(()=>readFile(join(dataDir,'trails',state.id,'results','n1.md')),/ENOENT/);
+});
+test('settings persist custom rules and expose the real client state and result contracts',async t=>{
+  const {control,agent,dataDir}=await fixture(t);
+  const saved=await control.action({action:'settings',config:{budget:{maxNodes:20,maxDepth:2,maxMinutes:10,maxPerHost:4},blacklist:[],browserAvailable:false,harvestAvailable:null},rules:[{name:'nav',host:'nav.example.com',kind:'directory'}]});
+  assert.equal(saved.config.budget.maxNodes,20);assert.equal(JSON.parse(await readFile(join(dataDir,'sites.user.json'),'utf8'))[0].name,'nav');
+  assert.equal((await control.action({action:'normalize',url:'https://nav.example.com'})).value.kind,'directory');
+  const reply=await control.action({action:'start',sessionId:agent.id,goal:'UI',seeds:['https://nav.example.com']});
+  assert.equal(reply.state.trail.id,reply.result.id);assert.equal(reply.state.capabilities.browser,false);
+  await control.action({action:'report',sessionId:agent.id,trailId:reply.result.id,nodeId:'n1',report:'STATUS: useful\nFOUND:\n- UI content'});
+  const result=await control.result(reply.result.id,'n1');assert.match(result.text,/UI content/);assert.ok(result.path.endsWith('n1.md'));
+});
+test('bound providers use scalar queue parents, explicit session rebinding and the current agent tool view',async t=>{
+  const {control,ctx,agent,dataDir}=await fixture(t);
+  const other={id:'limited',session:{id:'limited',header:{}}};
+  ctx.agents.get=id=>id===other.id?other:id===agent.id?agent:undefined;
+  ctx.sessions.get=id=>ctx.agents.get(id)?.session;
+  ctx.tools.view=current=>({visible:new Map((current?.id===other.id?['web_fetch']:['web_fetch','browser_read']).map(name=>[name,{name}]))});
+  const trail=await control.store.start({sessionId:agent.id,goal:'Old session',seeds:[],mode:'queue',runId:'bind-run'});
+  const provider=await control.provider.bindRun({trailId:trail.id,runId:'bind-run',sessionId:other.id});
+  assert.equal((await control.store.get(trail.id)).sessionId,other.id);
+  assert.deepEqual(provider.describe({text:'https://example.com'}).access,['fetch']);
+  const file=join(dataDir,'parent-result.md');await writeFile(file,'STATUS: useful\nSUMMARY: Parent.');
+  await provider.onResult({id:'q1',text:'https://example.com/parent',parent:null,depth:0},file);
+  await provider.onResult({id:'q2',text:'https://other.com/child',parent:'q1',depth:1},file);
+  const state=await control.store.get(trail.id);
+  assert.equal(state.nodes[1].foundBy,'n1');assert.equal(state.nodes[1].depth,1);assert.equal(state.edges[0].from,'n1');
+});
+test('X search is not harvest and structured harvest suggestions match the actual site',async t=>{
+  const {control,ctx,agent}=await fixture(t);
+  ctx.tools.view=()=>({visible:new Map(['x_search','web_fetch','zhihu_comments'].map(name=>[name,{name}]))});
+  const provider=await control.provider.bindRun({runId:'site-capabilities',sessionId:agent.id,goal:'Capabilities'});
+  assert.ok(!provider.describe({text:'https://tieba.baidu.com/p/123'}).access.includes('harvest'));
+  assert.ok(!provider.describe({text:'https://x.com/user'}).access.includes('harvest'));
+  assert.ok(provider.describe({text:'https://zhihu.com/question/123'}).access.includes('harvest'));
+  assert.equal(control.capabilities(agent).harvestSites.x,false);
+});

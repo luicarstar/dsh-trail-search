@@ -167,6 +167,8 @@ test('foreign directories under trails/ are skipped instead of blocking the whol
 
 test('redactText catches bare credential shapes and Chinese field names without false positives',()=>{
   const {redactText}=reportModule;
+  // Assemble the samples at runtime: writing a literal `AKIA...` / `ghp_...` into the
+  // repository trips GitHub push protection, which cannot tell a fixture from a real key.
   const sample=(...parts)=>parts.join('');
   const secrets=[
     sample('sk','-proj-','AbCdEf1234567890abcdefghij'),
@@ -180,7 +182,7 @@ test('redactText catches bare credential shapes and Chinese field names without 
     sample('h','f_','AbCdEf1234567890abcdefghijABCDEF'),
     sample('eyJhbGciOiJIUzI1NiJ9','.eyJzdWIiOiIxMjM0NTY3ODkwIn0','.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U'),
   ];
-  for(const secret of secrets) assert.ok(redactText('看这个 '+secret+' 结束').includes('[redacted]'),'not redacted: '+secret);
+  for(const secret of secrets) assert.ok(redactText('看这个 '+secret+' 结束').includes('[redacted]'),'not redacted: '+secret.slice(0,6)+'...');
   assert.ok(redactText('密码是 hunter2').includes('[redacted]'));
   assert.ok(redactText('密码：hunter2').includes('[redacted]'));
   assert.ok(redactText('密钥为 abcdef').includes('[redacted]'));

@@ -164,3 +164,27 @@ test('foreign directories under trails/ are skipped instead of blocking the whol
   assert.equal((await reopened.list())[0].id,trail.id);
   assert.deepEqual(await reopened.skipped(),['.sync-backup','临时文件夹 带空格','备份 2026']);
 });
+
+test('redactText catches bare credential shapes and Chinese field names without false positives',()=>{
+  const {redactText}=reportModule;
+  const sample=(...parts)=>parts.join('');
+  const secrets=[
+    sample('sk','-proj-','AbCdEf1234567890abcdefghij'),
+    sample('gh','p_','1234567890abcdefghijABCDEFGHIJ1234'),
+    sample('github','_pat_','11ABCDEFG0abcdefghij_KlMnOpQrStUv'),
+    sample('xox','b-','123456789012-abcdefghijkl'),
+    sample('AK','IA','IOSFODNN7EXAMPLE'),
+    sample('AIz','a','SyA1234567890abcdefghijklmnopqrstuv'),
+    sample('gl','pat-','AbCdEf1234567890abcd'),
+    sample('np','m_','1234567890abcdefghijABCDEFGHIJ123456'),
+    sample('h','f_','AbCdEf1234567890abcdefghijABCDEF'),
+    sample('eyJhbGciOiJIUzI1NiJ9','.eyJzdWIiOiIxMjM0NTY3ODkwIn0','.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U'),
+  ];
+  for(const secret of secrets) assert.ok(redactText('看这个 '+secret+' 结束').includes('[redacted]'),'not redacted: '+secret);
+  assert.ok(redactText('密码是 hunter2').includes('[redacted]'));
+  assert.ok(redactText('密码：hunter2').includes('[redacted]'));
+  assert.ok(redactText('密钥为 abcdef').includes('[redacted]'));
+  // Ordinary prose must survive untouched.
+  for(const text of ['这是一个正常句子。','https://github.com/dsh-cc/dsh-cc','密码学很有趣','token 化处理','时间为 12:34:56'])
+    assert.equal(redactText(text),text,'false positive: '+text);
+});

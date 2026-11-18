@@ -66,8 +66,13 @@ class TrailController {
     const result=await this.store.start({sessionId:idOf(agent),goal:args.goal,seeds:args.seeds,force:args.force,budget:args.budget});this.changed(result.id);return result;
   }
   async next(args,agent){
-    const nodes=await this.store.next(args.trailId,args.n);this.changed(args.trailId);
-    const capabilities=this.capabilities(agent);return nodes.map(node=>({...node,...describeAccess(node,{capabilities,skills:this.skills})}));
+    const {nodes,reason,pauseReason}=await this.store.claim(args.trailId,args.n);this.changed(args.trailId);
+    const capabilities=this.capabilities(agent);
+    const annotated=nodes.map(node=>({...node,...describeAccess(node,{capabilities,skills:this.skills})}));
+    // An empty batch always carries the reason, so "finished" is never confused with
+    // "paused" or "budget exhausted". Non-empty batches stay a plain array of nodes.
+    if(annotated.length)return annotated;
+    return {nodes:[],reason,...(pauseReason?{pauseReason}:{}),...(reason==='max-minutes'?{hint:'时间预算已用尽；用 resume 重新开始计时。'}:reason==='paused'?{hint:'trail 未在运行；用 resume 继续。'}:reason==='done'?{hint:'全部线索已处理完，搜索结束。'}:{})};
   }
   async report(args,agent){
     const result=await this.store.report(args.trailId,args.nodeId,args.report);

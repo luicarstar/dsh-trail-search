@@ -285,17 +285,37 @@ export class TrailStore {
       await this._commit(state,draft);return replies;
     });
   }
-  next(id,n=1) {
+  // Returns {nodes, reason}. `reason` explains an empty batch so callers never have to
+  // guess between "finished", "paused" and "budget exhausted":
+  //   claimed   - nodes were handed out
+  //   empty     - trail is active but has no pending node left
+  //   done      - trail finished by this call (last pending node settled)
+  //   paused    - trail was not active; see meta.pauseReason
+  //   max-minutes - time budget exhausted by this call
+  claim(id,n=1) {
     return this._serial(async () => {
       if (!Number.isInteger(n) || n < 1 || n > 10) throw new Error('n 必须是 1 到 10 的整数');
       const state=this._find(id),draft=draftOf(state);
-      if (state.meta.status !== 'active') return [];
-      if (usesLocalBudget(state) && this.now()-Date.parse(state.meta.startedAt) >= state.meta.config.budget.maxMinutes*60000) { draft.meta.status='paused';draft.meta.pauseReason='max-minutes';await this._commit(state,draft);return []; }
+      // Check `done` before the generic not-active branch: a finished trail is also
+      // not active, but reporting it as "paused" would tell the caller to resume work
+      // that is actually complete.
+      if (state.meta.status === 'done') return {nodes:[],reason:'done'};
+      if (state.meta.status !== 'active') return {nodes:[],reason:'paused',pauseReason:state.meta.pauseReason ?? null};
+      if (usesLocalBudget(state) && this.now()-Date.parse(state.meta.startedAt) >= state.meta.config.budget.maxMinutes*60000) {
+        draft.meta.status='paused';draft.meta.pauseReason='max-minutes';await this._commit(state,draft);
+        return {nodes:[],reason:'max-minutes',pauseReason:'max-minutes'};
+      }
       const chosen=[...draft.nodes.values()].filter(node => node.status === 'pending').sort((a,b) => b.priority-a.priority || Number(a.id.slice(1))-Number(b.id.slice(1))).slice(0,n);
       for(const node of chosen) draft.nodes.set(node.id,{...node,status:'running',updatedAt:timestamp(this.now())});
-      if (!chosen.length) this._settle(draft);
-      await this._commit(state,draft);return copy(chosen.map(node => draft.nodes.get(node.id)));
+      const finished=!chosen.length;
+      if (finished) this._settle(draft);
+      await this._commit(state,draft);
+      if (chosen.length) return {nodes:copy(chosen.map(node => draft.nodes.get(node.id))),reason:'claimed'};
+      return {nodes:[],reason:draft.meta.status === 'done' ? 'done' : 'empty'};
     });
+  }
+  next(id,n=1) {
+    return this.claim(id,n).then(result => result.nodes);
   }
   report(id,nodeId,text,{resultPath}={}) {
     return this._serial(async () => {

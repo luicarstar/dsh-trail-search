@@ -188,3 +188,26 @@ test('redactText catches bare credential shapes and Chinese field names without 
   for(const text of ['这是一个正常句子。','https://github.com/dsh-cc/dsh-cc','密码学很有趣','token 化处理','时间为 12:34:56'])
     assert.equal(redactText(text),text,'false positive: '+text);
 });
+
+test('claim reports why a batch is empty instead of a bare array',async t=>{
+  // Finished: every node skipped.
+  const {store}=await fixture(t);
+  const trail=await store.start({sessionId:'s',goal:'Claim reasons',seeds:['https://example.com']});
+  await store.skip(trail.id,['n1'],'done');
+  const finished=await store.claim(trail.id,1);
+  assert.deepEqual(finished.nodes,[]);assert.equal(finished.reason,'done');
+  // Claimed: a normal batch still returns nodes.
+  const trail2=await store.start({sessionId:'s',goal:'Claim normal',seeds:['https://example.com/x'],force:true});
+  const claimed=await store.claim(trail2.id,1);
+  assert.equal(claimed.reason,'claimed');assert.equal(claimed.nodes.length,1);
+  // next() keeps its array contract for existing callers.
+  assert.ok(Array.isArray(await store.next(trail2.id,1)));
+});
+test('claim distinguishes an exhausted time budget from a finished trail',async t=>{
+  let clock=Date.parse('2026-01-01T00:00:00Z');
+  const {store}=await fixture(t,{now:()=>clock});
+  const trail=await store.start({sessionId:'s',goal:'Budget',seeds:['https://example.com'],budget:{maxMinutes:1}});
+  clock+=120000;
+  const result=await store.claim(trail.id,1);
+  assert.deepEqual(result.nodes,[]);assert.equal(result.reason,'max-minutes');assert.equal(result.pauseReason,'max-minutes');
+});

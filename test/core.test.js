@@ -211,3 +211,22 @@ test('claim distinguishes an exhausted time budget from a finished trail',async 
   const result=await store.claim(trail.id,1);
   assert.deepEqual(result.nodes,[]);assert.equal(result.reason,'max-minutes');assert.equal(result.pauseReason,'max-minutes');
 });
+
+test('result paths inside the trail stay relative so the trail survives relocation',async t=>{
+  const {store,dataDir}=await fixture(t);
+  const trail=await store.start({sessionId:'s',goal:'Portable paths',seeds:['https://example.com']});
+  const trailDir=join(dataDir,'trails',trail.id);
+  const inside=join(trailDir,'results','n1.md');
+  await store.report(trail.id,'n1','STATUS: useful\nSUMMARY: Inside.\nFOUND:\nNEW:',{resultPath:inside});
+  const node=(await store.get(trail.id)).nodes.find(n=>n.id==='n1');
+  assert.equal(node.resultFile,'results/n1.md','must be stored relative to the trail directory');
+  assert.ok(!node.resultExternal);
+  // An absolute path outside the trail is kept verbatim but flagged, never disguised
+  // as a portable reference.
+  const outside=join(dataDir,'elsewhere.md');
+  await store.report(trail.id,'n1','STATUS: useful\nSUMMARY: Outside.\nFOUND:\nNEW:',{resultPath:outside});
+  const flagged=(await store.get(trail.id)).nodes.find(n=>n.id==='n1');
+  assert.equal(flagged.resultExternal,true);
+  assert.equal(flagged.resultFile,outside);
+  assert.equal((await store.readResult(trail.id,'n1')).external,true);
+});

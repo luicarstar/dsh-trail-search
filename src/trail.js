@@ -1,5 +1,5 @@
 import { mkdir, open, readFile, appendFile, readdir, rename, rm, truncate } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { normalize } from './normalize.js';
 import { compileUserRules } from './sites-user.js';
@@ -325,15 +325,33 @@ export class TrailStore {
       const report=parseReport(text,{kind:node.kind});
       const kind=report.kind ?? (node.kind === 'web' && classifyDirectory({url:node.url,title:report.summary,links:[...report.raw.matchAll(/https?:\/\/[^\s<>|]+/g)].map(x => x[0])}) ? 'directory' : node.kind);
       const parsed=kind === 'directory' && node.kind !== 'directory' && !report.kind ? parseReport(text,{kind}) : report;
-      const resultFile=resultPath ? resolve(resultPath) : `results/${node.id}.md`;
+      // Keep the stored path portable. A result file inside this trail's own directory
+      // is stored relative to it, so the trail survives a drive change or a copy to
+      // another machine. Anything outside is stored as-is and flagged, because it
+      // genuinely cannot be relocated and silently pretending otherwise would make a
+      // broken reference look valid.
+      const trailDir=this._dir(id);
+      let resultFile,externalResult;
+      if (!resultPath) {
+        resultFile=`results/${node.id}.md`;
+      } else {
+        const absolute=resolve(resultPath),insidePath=relative(trailDir,absolute);
+        if (insidePath && !insidePath.startsWith('..') && !isAbsolute(insidePath)) resultFile=insidePath.split(sep).join('/');
+        else { resultFile=absolute; externalResult=true; }
+      }
       const updated={...node,kind,status:parsed.status === 'blocked' ? 'blocked' : 'done',summary:parsed.summary,resultFile,updatedAt:timestamp(this.now())};
+      if (externalResult) updated.resultExternal=true; else delete updated.resultExternal;
       delete updated.verdict;delete updated.blockedReason;delete updated.skipReason;delete updated.recoveryReason;
       if (['useful','useless'].includes(parsed.status)) updated.verdict=parsed.status;
       if (parsed.status === 'blocked') updated.blockedReason=parsed.blockedReason;
       draft.nodes.set(nodeId,updated);
       const replies=parsed.status ? await this._addItems(draft,parsed.items,nodeId) : [];
       this._activatePending(draft);
-      if(resultPath)draft.meta.resultsDir=resolve(resultPath,'..');
+      if(resultPath){
+        const absolute=resolve(resultPath),relativeDir=relative(trailDir,resolve(absolute,'..'));
+        draft.meta.resultsDir=(relativeDir && !relativeDir.startsWith('..') && !isAbsolute(relativeDir))
+          ? relativeDir.split(sep).join('/') : resolve(absolute,'..');
+      }
       // Body and derived state become durable in the same journal record.
       draft.results.set(node.id,parsed.raw);
       this._settle(draft);await this._commit(state,draft);
@@ -418,8 +436,10 @@ export class TrailStore {
   readResult(id,nodeId) {
     return this._serial(async()=>{
       const state=this._find(id),node=state.nodes.get(nodeId);if(!node?.resultFile)throw Object.assign(new Error('节点尚无结果文件'),{status:404});
-      const path=resolve(this._dir(id),node.resultFile);
-      return {nodeId,text:state.results.get(nodeId)??redactText(await readFile(path,'utf8')),path};
+      // Relative resultFile resolves inside the trail directory; an absolute one is a
+      // deliberately external reference and is used as-is.
+      const path=isAbsolute(node.resultFile)?node.resultFile:resolve(this._dir(id),node.resultFile);
+      return {nodeId,text:state.results.get(nodeId)??redactText(await readFile(path,'utf8')),path,...(node.resultExternal?{external:true}:{})};
     });
   }
   list(sessionId) { return this._serial(() => copy([...this.trails.values()].filter(t => sessionId === undefined || t.meta.sessionId === sessionId).map(t => t.meta).sort((a,b) => b.updatedAt.localeCompare(a.updatedAt)))); }
